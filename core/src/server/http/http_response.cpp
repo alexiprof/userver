@@ -169,20 +169,13 @@ void HttpResponse::SendResponse(engine::io::Socket& socket) {
   const auto& data = GetData();
   const bool is_body_forbidden = IsBodyForbiddenForStatus(status_);
 
-  static constexpr auto kMinSeparateDataSize = 50000;  //  50KB
-  bool separate_data_send = data.size() > kMinSeparateDataSize;
-
   // According to https://www.chromium.org/spdy/spdy-whitepaper/
   // "typical header sizes of 700-800 bytes is common"
   // Adjusting it to 1KiB to fit jemalloc size class
   static constexpr auto kTypicalHeadersSize = 1024;
 
   std::string os;
-  if (!is_body_forbidden && !separate_data_send && !is_head_request) {
-    os.reserve(kTypicalHeadersSize + data.size());
-  } else {
-    os.reserve(kTypicalHeadersSize);
-  }
+  os.reserve(kTypicalHeadersSize);
 
   os.append("HTTP/");
   fmt::format_to(std::back_inserter(os), FMT_COMPILE("{}.{} {} "),
@@ -231,38 +224,25 @@ void HttpResponse::SetBodyNotstreamed(engine::io::Socket& socket,
   const bool is_head_request = request_.GetOrigMethod() == HttpMethod::kHead;
   const auto& data = GetData();
 
-  static constexpr auto kMinSeparateDataSize = 50000;  //  50KB
-  bool separate_data_send = data.size() > kMinSeparateDataSize;
-
   if (!is_body_forbidden) {
     impl::OutputHeader(os, USERVER_NAMESPACE::http::headers::kContentLength,
                        fmt::format(FMT_COMPILE("{}"), data.size()));
   }
   os.append(kCrlf);
 
-  // Transmit HTTP response body
-  if (!is_body_forbidden) {
-    if (!separate_data_send && !is_head_request) {
-      os.append(data);
-    }
-  } else {
-    separate_data_send = false;
-    if (!data.empty()) {
-      LOG_LIMITED_WARNING()
-          << "Non-empty body provided for response with HTTP code "
-          << static_cast<int>(status_)
-          << " which does not allow one, it will be dropped";
-    }
+  if (is_body_forbidden && !data.empty()) {
+    LOG_LIMITED_WARNING()
+        << "Non-empty body provided for response with HTTP code "
+        << static_cast<int>(status_)
+        << " which does not allow one, it will be dropped";
   }
 
-  // send HTTP headers + (maybe) HTTP body
-  size_t sent_bytes = socket.SendAll(os.data(), os.size(), {});
-
-  if (separate_data_send && sent_bytes == os.size() && !is_head_request) {
-    std::string().swap(os);  // free memory before time consuming operation
-
-    // If response is too big, copying is more expensive than +1 syscall
-    sent_bytes += socket.SendAll(data.data(), data.size(), {});
+  ssize_t sent_bytes = 0;
+  if (!is_head_request && !is_body_forbidden) {
+    sent_bytes = socket.SendAll(
+        {{os.data(), os.size()}, {data.data(), data.size()}}, {});
+  } else {
+    sent_bytes = socket.SendAll(os.data(), os.size(), {});
   }
 
   SetSentTime(std::chrono::steady_clock::now());

@@ -4,6 +4,7 @@
 /// @brief @copybrief engine::io::Socket
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/io/common.hpp>
@@ -75,6 +76,17 @@ class USERVER_NODISCARD Socket final : public ReadableBase {
   /// @note Can return less than len if socket is closed by peer.
   [[nodiscard]] size_t RecvAll(void* buf, size_t len, Deadline deadline);
 
+  /// @brief Sends exactly N buffers to the socket.
+  /// @note Can return less than len if socket is closed by peer.
+  template <std::size_t N>
+  [[nodiscard]] size_t SendAll(std::pair<const void*, std::size_t>(&&data)[N],
+                               Deadline deadline);
+
+  /// @brief Sends exactly n buffers to the socket.
+  /// @note Can return less than len if socket is closed by peer.
+  [[nodiscard]] size_t SendAll(struct iovec* list, std::size_t n,
+                               Deadline deadline);
+
   /// @brief Sends exactly len bytes to the socket.
   /// @note Can return less than len if socket is closed by peer.
   [[nodiscard]] size_t SendAll(const void* buf, size_t len, Deadline deadline);
@@ -143,6 +155,19 @@ class USERVER_NODISCARD Socket final : public ReadableBase {
   Sockaddr peername_;
   Sockaddr sockname_;
 };
+
+template <std::size_t N>
+size_t Socket::SendAll(std::pair<const void*, std::size_t>(&&data)[N],
+                       Deadline deadline) {
+  static_assert(N > 0, "Attempt to SendAll is empty");
+  struct iovec list[N];
+  for (auto i = 0; i < N; ++i) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    list[i].iov_base = const_cast<void*>(data[i].first);
+    list[i].iov_len = data[i].second;
+  }
+  return SendAll(list, N, deadline);
+}
 
 }  // namespace engine::io
 

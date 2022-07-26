@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/uio.h>
 #include <atomic>
 #include <cerrno>
 
@@ -25,6 +26,11 @@ enum class TransferMode {
   kWhole,    ///< operation may complete only after the whole buffer is
              ///< transferred
   kOnce,     ///< operation will complete after the first successful transfer
+};
+
+enum class ErrorMode {
+  kProcessed,
+  kCancel,
 };
 
 class FdControl;
@@ -60,6 +66,11 @@ class Direction final {
                    TransferMode mode, Deadline deadline,
                    const Context&... context);
 
+  template <typename IoFunc, typename... Context>
+  size_t PerformIoV(Lock& lock, IoFunc&& io_func, struct iovec* list,
+                    std::size_t size, TransferMode mode, Deadline deadline,
+                    const Context&... context);
+
  private:
   friend class FdControl;
   explicit Direction(Kind kind);
@@ -72,6 +83,10 @@ class Direction final {
 
   // does not notify
   void Invalidate();
+
+  template <typename... Context>
+  ErrorMode ErrorProcessing(int code_error, size_t count, TransferMode mode,
+                            Deadline deadline, Context&... context);
 
   static void IoWatcherCb(struct ev_loop*, ev_io*, int) noexcept;
 
@@ -115,6 +130,87 @@ class FdControl final {
   Direction write_;
 };
 
+template <typename... Context>
+ErrorMode Direction::ErrorProcessing(int code_error, size_t processed_bytes,
+                                     TransferMode mode, Deadline deadline,
+                                     Context&... context) {
+  if (code_error == EINTR) {
+    return ErrorMode::kProcessed;
+  } else if (code_error == EWOULDBLOCK || code_error == EAGAIN) {
+    if (processed_bytes != 0 && mode != TransferMode::kWhole) {
+      return ErrorMode::kCancel;
+    }
+    if (current_task::ShouldCancel()) {
+      throw(IoCancelled(/*bytes_transferred =*/processed_bytes)
+            << ... << context);
+    }
+    if (DoWait(deadline) ==
+        engine::impl::TaskContext::WakeupSource::kDeadlineTimer) {
+      throw(IoTimeout(/*bytes_transferred =*/processed_bytes)
+            << ... << context);
+    }
+    if (!IsValid()) {
+      throw((IoException() << "Fd closed during ") << ... << context);
+    }
+  } else {
+    IoSystemError ex(code_error, "Direction::PerformIo");
+    ex << "Error while ";
+    (ex << ... << context);
+    ex << ", fd=" << fd_;
+    auto log_level = logging::Level::kError;
+    if (code_error == ECONNRESET || code_error == EPIPE) {
+      log_level = logging::Level::kWarning;
+    }
+    LOG(log_level) << ex;
+    if (processed_bytes != 0) {
+      return ErrorMode::kCancel;
+    }
+    throw std::move(ex);
+  }
+  return ErrorMode::kProcessed;
+}
+
+template <typename IoFunc, typename... Context>
+size_t Direction::PerformIoV(Lock&, IoFunc&& io_func, struct iovec* list,
+                             std::size_t size, TransferMode mode,
+                             Deadline deadline, const Context&... context) {
+  std::size_t processed_bytes = 0;
+  do {
+    auto chunk_size = io_func(fd_, list, size);
+
+    if (chunk_size > 0) {
+      processed_bytes += chunk_size;
+      if (mode == TransferMode::kOnce) {
+        break;
+      }
+      auto offset = chunk_size;
+      do {
+        if (auto len = list->iov_len; offset >= len) {
+          ++list;
+          offset -= len;
+          --size;
+          UASSERT(size != 0 || offset == 0);
+        } else {
+          list->iov_len -= offset;
+          list->iov_base = static_cast<char*>(list->iov_base) + offset;
+          offset = 0;
+        }
+      } while (offset != 0);
+    } else if (!chunk_size) {
+      break;
+    } else {
+      if (auto status = ErrorProcessing(errno, processed_bytes, mode, deadline,
+                                        context...);
+          status == ErrorMode::kCancel) {
+        break;
+      } else if (status == ErrorMode::kProcessed) {
+        continue;
+      }
+    }
+  } while (size != 0);
+  return processed_bytes;
+}
+
 template <typename IoFunc, typename... Context>
 size_t Direction::PerformIo(Lock&, IoFunc&& io_func, void* buf, size_t len,
                             TransferMode mode, Deadline deadline,
@@ -134,38 +230,14 @@ size_t Direction::PerformIo(Lock&, IoFunc&& io_func, void* buf, size_t len,
       }
     } else if (!chunk_size) {
       break;
-    } else if (errno == EINTR) {
-      continue;
-    } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-      if (pos != begin && mode != TransferMode::kWhole) {
-        break;
-      }
-      if (current_task::ShouldCancel()) {
-        throw(IoCancelled(/*bytes_transferred =*/pos - begin)
-              << ... << context);
-      }
-      if (DoWait(deadline) ==
-          engine::impl::TaskContext::WakeupSource::kDeadlineTimer) {
-        throw(IoTimeout(/*bytes_transferred =*/pos - begin) << ... << context);
-      }
-      if (!IsValid()) {
-        throw((IoException() << "Fd closed during ") << ... << context);
-      }
     } else {
-      const auto err_value = errno;
-      IoSystemError ex(err_value, "Direction::PerformIo");
-      ex << "Error while ";
-      (ex << ... << context);
-      ex << ", fd=" << fd_;
-      auto log_level = logging::Level::kError;
-      if (err_value == ECONNRESET || err_value == EPIPE) {
-        log_level = logging::Level::kWarning;
-      }
-      LOG(log_level) << ex;
-      if (pos != begin) {
+      if (auto status =
+              ErrorProcessing(errno, pos - begin, mode, deadline, context...);
+          status == ErrorMode::kProcessed) {
+        continue;
+      } else if (status == ErrorMode::kCancel) {
         break;
       }
-      throw std::move(ex);
     }
   }
   return pos - begin;

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -219,6 +220,16 @@ size_t Socket::RecvAll(void* buf, size_t len, Deadline deadline) {
   impl::Direction::Lock lock(dir);
   return dir.PerformIo(lock, &RecvWrapper, buf, len, impl::TransferMode::kWhole,
                        deadline, "RecvAll from ", peername_);
+}
+
+size_t Socket::SendAll(struct iovec* list, std::size_t n, Deadline deadline) {
+  if (!IsValid()) {
+    throw IoException("Attempt to SendAll to closed socket");
+  }
+  auto& dir = fd_control_->Write();
+  impl::Direction::Lock lock(dir);
+  return dir.PerformIoV(lock, &writev, list, n, impl::TransferMode::kWhole,
+                        deadline, "SendAll to ", peername_);
 }
 
 size_t Socket::SendAll(const void* buf, size_t len, Deadline deadline) {
