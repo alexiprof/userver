@@ -9,8 +9,16 @@ else()
 endif()
 
 if (USERVER_FEATURE_GRPC)
-  list(APPEND TESTSUITE_REQUIREMENTS
-    ${USERVER_ROOT_DIR}/testsuite/requirements-grpc.txt)
+    if(Protobuf_FOUND)
+      if(Protobuf_VERSION VERSION_GREATER 3.20.0)
+        list(APPEND TESTSUITE_REQUIREMENTS
+          ${USERVER_ROOT_DIR}/testsuite/requirements-grpc.txt)
+      else()
+        list(APPEND TESTSUITE_REQUIREMENTS
+          ${USERVER_ROOT_DIR}/testsuite/requirements-grpc_old.txt)
+	  message(STATUS "Usage old version protobuf")
+      endif()
+    endif()
 endif()
 
 userver_venv_setup(
